@@ -4,6 +4,8 @@ Import the repository into Vercel and use the default project root. The included
 `vercel.json` builds the Vite frontend into `dist`, serves it as a single-page
 app, and rewrites `/api/*` requests to the Express function in `api/index.ts`.
 No separate Vercel output or build configuration is needed.
+The function explicitly includes `better-sqlite3`'s Linux native prebuilds,
+which are resolved dynamically at runtime.
 
 Set `APP_URL` to the canonical deployment origin (for example,
 `https://your-project.vercel.app`). The frontend uses the Firebase project in

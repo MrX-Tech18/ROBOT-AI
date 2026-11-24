@@ -1,6 +1,11 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "includeFiles": "node_modules/better-sqlite3/prebuilds/linux*.node"
+    }
+  },
   "rewrites": [
     {
       "source": "/api/:path*",
