@@ -1,5 +1,4 @@
 import Database from 'better-sqlite3';
-import fs from 'node:fs';
 import path from 'node:path';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { db } from '../src/db/index.ts';
@@ -28,6 +27,7 @@ import {
   normalizeMicrosoftTenantId,
   SERVICE_CATALOG,
 } from '../src/shared/connectorLogic.ts';
+import { getDataDir } from './dataDir.ts';
 import type {
   BotId,
   ConnectorActivityLogView,
@@ -55,11 +55,7 @@ let pgUnavailableCached = false;
 
 function getSqliteFallbackDb(): Database.Database {
   if (sqliteFallbackDb) return sqliteFallbackDb;
-  const dataDir = path.resolve(process.cwd(), '.data');
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-  const dbPath = path.join(dataDir, 'robot_office.db');
+  const dbPath = path.join(getDataDir(), 'robot_office.db');
   const instance = new Database(dbPath);
   instance.pragma('journal_mode = WAL');
   instance.pragma('foreign_keys = ON');
