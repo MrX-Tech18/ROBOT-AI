@@ -1,0 +1,6 @@
+{
+  "name": "ROBOT OFFICE AI",
+  "description": "Your Five AI Employees. Your One Smart Office — Interactive 2D virtual office featuring five cute autonomous AI robot specialists, multi-bot collaboration, CEO command center, approvals, and workflow automation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
