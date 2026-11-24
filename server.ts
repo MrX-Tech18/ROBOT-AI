@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import {
   addAutomationLog,
   addCalendarEvent,
@@ -1831,6 +1830,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   if (options.serveFrontend !== false) {
     // --- Vite Dev Middleware / Static Production Assets ---
     if (!isProduction) {
+      const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
         server: { middlewareMode: true },
         appType: 'spa',
