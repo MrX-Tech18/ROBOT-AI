@@ -9,7 +9,11 @@ Set `APP_URL` to the canonical deployment origin (for example,
 `https://your-project.vercel.app`). The frontend uses the Firebase project in
 `firebase-applet-config.json`; enable Google as a Firebase Authentication
 provider and add the Vercel hostname to Firebase Authentication's authorized
-domains.
+domains. Basic Google sign-in requests only the user's identity. Gmail,
+Calendar, and Drive permissions are requested later, when the user connects
+that Workspace service. Those sensitive or restricted scopes still require
+Google OAuth consent-screen testing access or Google's verification before
+they can be used by the general public.
 
 The server's primary application data is stored in SQLite. On Vercel it uses
 `/tmp/robot-ai`, which is writable but temporary and isolated to a function

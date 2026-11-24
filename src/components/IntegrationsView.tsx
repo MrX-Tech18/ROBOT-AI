@@ -7,6 +7,8 @@ import {
   signInWithGoogleWorkspace,
 } from '../lib/googleWorkspace';
 import {
+  GOOGLE_WORKSPACE_SCOPES,
+  getServiceCatalogEntry,
   hasActiveWorkflowDependency,
   isAllowedPostMessageOrigin,
 } from '../shared/connectorLogic';
@@ -198,7 +200,7 @@ export default function IntegrationsView({
     setConnectorError(null);
     setBusyService('gmail');
     try {
-      const authResult = await signInWithGoogleWorkspace();
+      const authResult = await signInWithGoogleWorkspace(GOOGLE_WORKSPACE_SCOPES);
       for (const service of ['gmail', 'google_calendar', 'google_drive'] as const) {
         const res = await api.connectGoogleConnector(service, authResult.accessToken);
         setDashboard(res.dashboard);
@@ -234,12 +236,12 @@ export default function IntegrationsView({
     ) {
       setBusyService(connector.serviceName);
       try {
-        let token = getCachedGoogleAccessToken();
-        if (!token) {
-          const authRes = await signInWithGoogleWorkspace();
-          token = authRes.accessToken;
-        }
-        const res = await api.connectGoogleConnector(connector.serviceName, token);
+        const scopes = getServiceCatalogEntry(connector.serviceName).requiredGoogleScopes;
+        const authRes = await signInWithGoogleWorkspace(scopes);
+        const res = await api.connectGoogleConnector(
+          connector.serviceName,
+          authRes.accessToken
+        );
         setDashboard(res.dashboard);
         setTestResults((prev) => ({
           ...prev,

@@ -5,14 +5,13 @@ import {
   type User,
 } from 'firebase/auth';
 import { auth } from './firebase';
-import { GOOGLE_WORKSPACE_SCOPES } from '../shared/connectorLogic';
 
 let isSigningIn = false;
 let cachedGoogleAccessToken: string | null = null;
 
-function buildGoogleWorkspaceProvider(): GoogleAuthProvider {
+function buildGoogleWorkspaceProvider(scopes: readonly string[]): GoogleAuthProvider {
   const provider = new GoogleAuthProvider();
-  for (const scope of GOOGLE_WORKSPACE_SCOPES) {
+  for (const scope of scopes) {
     provider.addScope(scope);
   }
   provider.setCustomParameters({
@@ -38,14 +37,28 @@ export function initGoogleWorkspaceAuth(
   });
 }
 
-export async function signInWithGoogleWorkspace(): Promise<{
+export async function signInWithGoogle(): Promise<{
+  user: User;
+  idToken: string;
+}> {
+  isSigningIn = true;
+  try {
+    const result = await signInWithPopup(auth, new GoogleAuthProvider());
+    const idToken = await result.user.getIdToken();
+    return { user: result.user, idToken };
+  } finally {
+    isSigningIn = false;
+  }
+}
+
+export async function signInWithGoogleWorkspace(scopes: readonly string[]): Promise<{
   user: User;
   idToken: string;
   accessToken: string;
 }> {
   isSigningIn = true;
   try {
-    const provider = buildGoogleWorkspaceProvider();
+    const provider = buildGoogleWorkspaceProvider(scopes);
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
