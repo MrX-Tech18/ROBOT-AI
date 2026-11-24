@@ -246,7 +246,7 @@ async function requireAuth(
   }
 }
 
-async function startServer() {
+export async function createApp(options: { serveFrontend?: boolean } = {}) {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -1829,32 +1829,41 @@ async function startServer() {
     }
   );
 
-  // --- Vite Dev Middleware / Static Production Assets ---
-  if (!isProduction) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      const indexFile = path.join(distPath, 'index.html');
-      if (fs.existsSync(indexFile)) {
-        res.sendFile(indexFile);
-      } else {
-        res.status(404).send('Build output not found.');
-      }
-    });
+  if (options.serveFrontend !== false) {
+    // --- Vite Dev Middleware / Static Production Assets ---
+    if (!isProduction) {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.resolve(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        const indexFile = path.join(distPath, 'index.html');
+        if (fs.existsSync(indexFile)) {
+          res.sendFile(indexFile);
+        } else {
+          res.status(404).send('Build output not found.');
+        }
+      });
+    }
   }
 
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`ROBOT OFFICE AI server running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+if (!process.env.VERCEL) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
