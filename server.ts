@@ -32,6 +32,11 @@ import {
 } from './server/db.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
+  FirebaseAccountConflictError,
+  sanitizeDemoConnectorDashboard,
+  serializeInlineScriptValue,
+} from './server/security.ts';
+import {
   appendConnectorLog,
   getConnectorDashboard,
   getConnectorRecord,
@@ -87,10 +92,14 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 async function dispatchN8nWorkflow(params: {
   userId: string;
+  isDemo?: boolean;
   botId: BotId;
   workflowName: string;
   payload: Record<string, unknown>;
 }): Promise<{ triggered: boolean; statusText: string }> {
+  if (params.isDemo) {
+    return { triggered: false, statusText: 'External integrations are disabled for demo accounts.' };
+  }
   const integrationId = `n8n_${params.botId}`;
   const integrations = getIntegrationsForUser(params.userId);
   const target = integrations.find((i) => i.id === integrationId);
@@ -159,9 +168,11 @@ async function dispatchN8nWorkflow(params: {
 
 async function dispatchTelegramAlert(params: {
   userId: string;
+  isDemo?: boolean;
   title: string;
   message: string;
 }): Promise<void> {
+  if (params.isDemo) return;
   const integrations = getIntegrationsForUser(params.userId);
   const tg = integrations.find((i) => i.id === 'telegram');
   if (!tg || !tg.connected || !tg.accountLabel) return;
@@ -239,9 +250,25 @@ async function requireAuth(
     req.user = user;
     req.token = token;
     next();
-  } catch {
+  } catch (error) {
+    if (error instanceof FirebaseAccountConflictError) {
+      res.status(409).json({ error: error.message });
+      return;
+    }
     res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
   }
+}
+
+function requireNonDemoUser(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  if (req.user?.isDemo) {
+    res.status(403).json({ error: 'External integrations are disabled for the shared demo account.' });
+    return;
+  }
+  next();
 }
 
 export async function createApp(options: { serveFrontend?: boolean } = {}) {
@@ -334,7 +361,11 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         name: decoded.name,
       });
       res.json({ token: idToken, user });
-    } catch {
+    } catch (error) {
+      if (error instanceof FirebaseAccountConflictError) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
       res.status(401).json({ error: 'Invalid Firebase authentication token.' });
     }
   });
@@ -536,6 +567,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
 
         await dispatchN8nWorkflow({
           userId: user.id,
+          isDemo: user.isDemo,
           botId: step.botId,
           workflowName: WORKFLOW_NAMES[step.botId],
           payload: {
@@ -597,6 +629,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
 
         void dispatchTelegramAlert({
           userId: user.id,
+          isDemo: user.isDemo,
           title: `Approval Required: ${approval.title}`,
           message: previousOutput.slice(0, 280),
         });
@@ -1255,7 +1288,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   });
 
   // --- Integrations & n8n Webhooks ---
-  app.put('/api/integrations/:id', requireAuth, (req, res) => {
+  app.put('/api/integrations/:id', requireAuth, requireNonDemoUser, (req, res) => {
     const user = req.user!;
     const { connected, endpointUrl, accountLabel, secretValue } = req.body as {
       connected?: boolean;
@@ -1297,7 +1330,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     res.json({ workspace: getWorkspacePayload(user), integration: updated });
   });
 
-  app.post('/api/integrations/:id/test', requireAuth, async (req, res) => {
+  app.post('/api/integrations/:id/test', requireAuth, requireNonDemoUser, async (req, res) => {
     const user = req.user!;
     const integrations = getIntegrationsForUser(user.id);
     const target = integrations.find((i) => i.id === req.params.id);
@@ -1314,6 +1347,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       const botId = target.id.replace('n8n_', '') as BotId;
       const result = await dispatchN8nWorkflow({
         userId: user.id,
+        isDemo: user.isDemo,
         botId,
         workflowName: target.name,
         payload: { event: 'connection_test', testedBy: user.email },
@@ -1392,7 +1426,9 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.get('/api/connectors', requireAuth, async (req, res) => {
     try {
       const dashboard = await getConnectorDashboard(req.user!.id, req.user!.email);
-      res.json(dashboard);
+      res.json(
+        req.user!.isDemo ? sanitizeDemoConnectorDashboard(dashboard) : dashboard
+      );
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Failed to load connectors.',
@@ -1400,7 +1436,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/connect-google', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/connect-google', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (service !== 'gmail' && service !== 'google_calendar' && service !== 'google_drive') {
       res.status(400).json({ error: 'Unsupported Google Workspace connector.' });
@@ -1424,7 +1460,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/connect-telegram', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/connect-telegram', requireAuth, requireNonDemoUser, async (req, res) => {
     if (req.params.service !== 'telegram') {
       res.status(400).json({ error: 'Invalid endpoint for this service.' });
       return;
@@ -1446,7 +1482,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/oauth/:provider/start', requireAuth, async (req, res) => {
+  app.post('/api/oauth/:provider/start', requireAuth, requireNonDemoUser, async (req, res) => {
     const provider = req.params.provider;
     if (provider !== 'outlook' && provider !== 'slack') {
       res.status(400).json({ error: 'Unsupported OAuth provider.' });
@@ -1494,7 +1530,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       oauthError,
     });
 
-    const safePayload = JSON.stringify({
+    const safePayload = serializeInlineScriptValue({
       type: 'OAUTH_COMPLETE',
       provider,
       ok: result.ok,
@@ -1511,7 +1547,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
       (function () {
         var payload = ${safePayload};
         if (window.opener && !window.opener.closed) {
-          window.opener.postMessage(payload, '*');
+          window.opener.postMessage(payload, window.location.origin);
         }
         window.close();
       })();
@@ -1523,7 +1559,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.get('/api/oauth/:provider/callback', handleOAuthCallback);
   app.get('/api/oauth/:provider/callback/', handleOAuthCallback);
 
-  app.patch('/api/connectors/:service/config', requireAuth, async (req, res) => {
+  app.patch('/api/connectors/:service/config', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (!VALID_SERVICES.has(service)) {
       res.status(400).json({ error: 'Unknown connector service.' });
@@ -1587,7 +1623,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/test', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/test', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (!VALID_SERVICES.has(service)) {
       res.status(400).json({ error: 'Unknown connector service.' });
@@ -1631,7 +1667,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/execute', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/execute', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (!VALID_SERVICES.has(service)) {
       res.status(400).json({ error: 'Unknown connector service.' });
@@ -1670,7 +1706,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/oauth-apps', requireAuth, async (req, res) => {
+  app.post('/api/connectors/oauth-apps', requireAuth, requireNonDemoUser, async (req, res) => {
     const { outlook, slack, encryptionKey } = req.body as {
       outlook?: { clientId?: string; clientSecret?: string; tenantId?: string };
       slack?: { clientId?: string; clientSecret?: string };
@@ -1701,7 +1737,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.delete('/api/connectors/oauth-apps/:provider', requireAuth, async (req, res) => {
+  app.delete('/api/connectors/oauth-apps/:provider', requireAuth, requireNonDemoUser, async (req, res) => {
     const provider = req.params.provider;
     if (provider !== 'outlook' && provider !== 'slack') {
       res.status(400).json({ error: 'Unsupported OAuth app provider.' });
@@ -1723,7 +1759,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/refresh', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/refresh', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (!VALID_SERVICES.has(service)) {
       res.status(400).json({ error: 'Unknown connector service.' });
@@ -1744,7 +1780,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/:service/disconnect', requireAuth, async (req, res) => {
+  app.post('/api/connectors/:service/disconnect', requireAuth, requireNonDemoUser, async (req, res) => {
     const service = req.params.service as ConnectorServiceKey;
     if (!VALID_SERVICES.has(service)) {
       res.status(400).json({ error: 'Unknown connector service.' });
@@ -1765,7 +1801,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     }
   });
 
-  app.post('/api/connectors/disconnect-all', requireAuth, async (req, res) => {
+  app.post('/api/connectors/disconnect-all', requireAuth, requireNonDemoUser, async (req, res) => {
     try {
       await disconnectAllConnectorsWithAudit(req.user!.id, req.user!.email);
       const dashboard = await getConnectorDashboard(req.user!.id, req.user!.email);
@@ -1780,6 +1816,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   app.patch(
     '/api/connectors/:service/employees/:employeeId',
     requireAuth,
+    requireNonDemoUser,
     async (req, res) => {
       const service = req.params.service as ConnectorServiceKey;
       const employeeId = req.params.employeeId as BotId;

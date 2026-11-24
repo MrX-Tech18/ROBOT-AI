@@ -7,6 +7,10 @@ import {
   detectCalendarConflicts,
 } from '../src/shared/officeLogic.ts';
 import { getDataDir } from './dataDir.ts';
+import {
+  assertFirebaseAccountCanBeLinked,
+  sanitizeDemoIntegrations,
+} from './security.ts';
 import type {
   ApprovalActionType,
   ApprovalRecord,
@@ -355,6 +359,7 @@ export function getOrCreateFirebaseUser(params: {
 
   const byEmail = findUserByEmail(params.email);
   if (byEmail) {
+    assertFirebaseAccountCanBeLinked(params.uid, byEmail.id);
     return {
       id: byEmail.id,
       name: byEmail.name,
@@ -1699,6 +1704,9 @@ export function getWorkspacePayload(user: UserProfile): WorkspacePayload {
   }));
 
   const integrations = getIntegrationsForUser(user.id);
+  const visibleIntegrations = user.isDemo
+    ? sanitizeDemoIntegrations(integrations)
+    : integrations;
 
   const chatRows = db
     .prepare(`SELECT * FROM chat_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 200`)
@@ -1731,7 +1739,7 @@ export function getWorkspacePayload(user: UserProfile): WorkspacePayload {
     calendarEvents,
     logs,
     notifications,
-    integrations,
+    integrations: visibleIntegrations,
     chatMessages,
     metrics,
   };
