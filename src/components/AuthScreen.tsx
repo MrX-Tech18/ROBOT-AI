@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { ArrowRight, Building2, Lock, Mail, Moon, Sun, User } from 'lucide-react';
 import { api } from '../lib/api';
-import { signInWithGoogleWorkspace } from '../lib/googleWorkspace';
+import { signInWithGoogle } from '../lib/googleWorkspace';
 import type { BotId, UserProfile } from '../shared/types';
 import CuteRobotAvatar from './CuteRobotAvatar';
 import GoogleSignInButton from './GoogleSignInButton';
@@ -61,7 +61,7 @@ export default function AuthScreen({
     setError(null);
     setSubmitting(true);
     try {
-      const googleAuth = await signInWithGoogleWorkspace();
+      const googleAuth = await signInWithGoogle();
       const res = await api.loginWithFirebase(googleAuth.idToken);
       onAuthenticated(res.user);
     } catch (err) {
