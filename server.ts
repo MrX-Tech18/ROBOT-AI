@@ -84,7 +84,6 @@ declare global {
   }
 }
 
-const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function dispatchN8nWorkflow(params: {
@@ -1852,18 +1851,4 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
   }
 
   return app;
-}
-
-async function startServer() {
-  const app = await createApp();
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ROBOT OFFICE AI server running on http://0.0.0.0:${PORT}`);
-  });
-}
-
-if (!process.env.VERCEL) {
-  startServer().catch((err) => {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  });
 }
