@@ -43,6 +43,7 @@ import {
   getDemoSession,
 } from './server/demoSession.ts';
 import { InvalidChatMessageError } from './server/firestore.ts';
+import { postWebhookJson } from './server/webhookRequest.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
   FirebaseAccountConflictError,
@@ -287,18 +288,17 @@ async function dispatchN8nWorkflow(params: {
 
   const startMs = Date.now();
   try {
-    const res = await fetch(target.endpointUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const res = await postWebhookJson(
+      target.endpointUrl,
+      {
         source: 'ROBOT_OFFICE_AI',
         botId: params.botId,
         workflow: params.workflowName,
         timestamp: new Date().toISOString(),
         ...params.payload,
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
+      },
+      8000
+    );
 
     const durationMs = Date.now() - startMs;
     const statusText = `HTTP ${res.status} ${res.statusText}`;

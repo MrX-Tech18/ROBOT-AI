@@ -25,7 +25,7 @@ import {
   canEmployeeUseConnector,
   getServiceCatalogEntry,
 } from '../src/shared/connectorLogic.ts';
-import { validateWebhookUrl } from '../src/shared/officeLogic.ts';
+import { postWebhookJson } from './webhookRequest.ts';
 import type {
   BotId,
   ConnectorDiagnosticMessage,
@@ -123,24 +123,19 @@ export async function dispatchIntegrationN8nWebhook(params: {
   event: string;
   payload: Record<string, unknown>;
 }): Promise<{ ok: boolean; statusText: string }> {
-  const check = validateWebhookUrl(params.webhookUrl);
-  if (!check.valid) {
-    return { ok: false, statusText: check.reason || 'Invalid webhook URL' };
-  }
   try {
-    const res = await fetch(params.webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const res = await postWebhookJson(
+      params.webhookUrl,
+      {
         source: 'ROBOT_OFFICE_AI',
         serviceName: params.serviceName,
         workflowName: params.workflowName,
         event: params.event,
         timestamp: new Date().toISOString(),
         ...params.payload,
-      }),
-      signal: AbortSignal.timeout(7000),
-    });
+      },
+      7000
+    );
     return {
       ok: res.ok,
       statusText: `HTTP ${res.status} ${res.statusText}`,
