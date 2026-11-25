@@ -9,88 +9,104 @@ import type {
   UserProfile,
   WorkspacePayload,
 } from '../shared/types';
-
-let inMemoryToken: string | null = null;
-
-export function setAuthToken(token: string | null): void {
-  inMemoryToken = token;
-}
-
-export function getAuthToken(): string | null {
-  return inMemoryToken;
-}
+import { auth } from './firebase';
 
 async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json');
   }
-  if (inMemoryToken) {
-    headers.set('Authorization', `Bearer ${inMemoryToken}`);
+  if (!headers.has('Authorization') && auth.currentUser) {
+    headers.set('Authorization', `Bearer ${await auth.currentUser.getIdToken()}`);
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetch(url, {
+    ...options,
+    credentials: options.credentials ?? 'same-origin',
+    headers,
+  });
   const data = (await res.json().catch(() => ({}))) as { error?: string } & T;
   if (!res.ok) {
     const err = new Error(data.error || `Request failed (${res.status})`) as Error & {
       payload?: unknown;
+      status?: number;
     };
     err.payload = data;
+    err.status = res.status;
     throw err;
   }
   return data;
 }
 
 export const api = {
-  async login(email: string, password: string): Promise<{ token: string; user: UserProfile }> {
-    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
+  async loginLegacy(email: string, password: string): Promise<{ customToken: string }> {
+    return apiFetch<{ customToken: string }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     });
-    setAuthToken(res.token);
-    return res;
   },
 
-  async loginWithFirebase(idToken: string): Promise<{ token: string; user: UserProfile }> {
-    setAuthToken(idToken);
-    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/firebase', {
+  async loginWithFirebase(idToken: string): Promise<{ user: UserProfile }> {
+    return apiFetch<{ user: UserProfile }>('/api/auth/login', {
       method: 'POST',
+      headers: { Authorization: `Bearer ${idToken}` },
     });
-    setAuthToken(res.token);
-    return res;
   },
 
   async register(params: {
     name: string;
     email: string;
     companyName: string;
-    password: string;
-  }): Promise<{ token: string; user: UserProfile }> {
-    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/register', {
+  }): Promise<{ user: UserProfile }> {
+    return apiFetch<{ user: UserProfile }>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify(params),
     });
-    setAuthToken(res.token);
-    return res;
   },
 
-  async enterDemo(): Promise<{ token: string; user: UserProfile }> {
-    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/demo', {
+  async enterDemo(): Promise<{ user: UserProfile }> {
+    return apiFetch<{ user: UserProfile }>('/api/demo/session', {
       method: 'POST',
     });
-    setAuthToken(res.token);
-    return res;
+  },
+
+  async exitDemo(): Promise<void> {
+    await apiFetch('/api/demo/session', { method: 'DELETE' });
+  },
+
+  async getCurrentSession(): Promise<{ user: UserProfile; mode: 'account' | 'demo' } | null> {
+    try {
+      return await apiFetch('/api/auth/me');
+    } catch (error) {
+      if (
+        error &&
+        typeof error === 'object' &&
+        'status' in error &&
+        error.status === 401
+      ) {
+        return null;
+      }
+      throw error;
+    }
   },
 
   async logout(): Promise<void> {
-    if (inMemoryToken) {
-      await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
-    }
-    setAuthToken(null);
+    await apiFetch('/api/auth/logout', { method: 'POST' });
   },
 
   async getWorkspace(): Promise<WorkspacePayload> {
     return apiFetch<WorkspacePayload>('/api/workspace');
+  },
+
+  async getUserChats(): Promise<{ messages: WorkspacePayload['chatMessages'] }> {
+    return apiFetch('/api/users/me/chats');
+  },
+
+  async saveUserChats(messages: WorkspacePayload['chatMessages']): Promise<void> {
+    await apiFetch('/api/users/me/chats', {
+      method: 'POST',
+      body: JSON.stringify({ messages }),
+    });
   },
 
   async updateProfile(updates: {
@@ -271,12 +287,13 @@ export const api = {
     provider: 'outlook' | 'slack'
   ): Promise<{ authUrl: string } | OAuthSetupInstructionPayload> {
     const headers = new Headers({ 'Content-Type': 'application/json' });
-    if (inMemoryToken) {
-      headers.set('Authorization', `Bearer ${inMemoryToken}`);
+    if (auth.currentUser) {
+      headers.set('Authorization', `Bearer ${await auth.currentUser.getIdToken()}`);
     }
     const res = await fetch(`/api/oauth/${provider}/start`, {
       method: 'POST',
       headers,
+      credentials: 'same-origin',
     });
     const data = (await res.json()) as
       | { authUrl: string }

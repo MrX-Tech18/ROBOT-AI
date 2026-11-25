@@ -306,24 +306,100 @@ export function createUser(params: {
   };
 }
 
-export function getOrCreateDemoUser(): UserProfile {
-  const existing = findUserByEmail('ceo@robotoffice.ai');
+export function createDemoUser(id: string): UserProfile {
+  if (!/^demo_[A-Za-z0-9_-]{20,64}$/.test(id)) {
+    throw new Error('Invalid demo session identity.');
+  }
+  const existing = db
+    .prepare(
+      `SELECT id, name, email, company_name, theme, is_demo FROM users WHERE id = ?`
+    )
+    .get(id) as
+    | {
+        id: string;
+        name: string;
+        email: string;
+        company_name: string;
+        theme: 'light' | 'dark';
+        is_demo: number;
+      }
+    | undefined;
   if (existing) {
+    if (existing.is_demo !== 1) {
+      throw new Error('Demo session identity conflicts with an account.');
+    }
     return {
       id: existing.id,
-      name: existing.name,
-      email: existing.email,
-      companyName: existing.company_name,
+      name: 'Guest',
+      email: '',
+      companyName: 'Demo Workspace',
       theme: existing.theme,
       isDemo: true,
     };
   }
-  return createUser({
-    name: 'Alex Morgan (CEO)',
-    email: 'ceo@robotoffice.ai',
-    companyName: 'Robot Office HQ',
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO users (id, name, email, company_name, password_hash, theme, is_demo, created_at)
+     VALUES (?, 'Guest', ?, 'Demo Workspace', ?, 'dark', 1, ?)`
+  ).run(id, `${id}@demo.invalid`, `demo-session:${crypto.randomBytes(16).toString('hex')}`, now);
+  seedWorkspaceForUser(id);
+  return {
+    id,
+    name: 'Guest',
+    email: '',
+    companyName: 'Demo Workspace',
+    theme: 'dark',
     isDemo: true,
+  };
+}
+
+export function getUserById(id: string): UserProfile | null {
+  const row = db
+    .prepare(
+      `SELECT id, name, email, company_name, theme, is_demo FROM users WHERE id = ?`
+    )
+    .get(id) as
+    | {
+        id: string;
+        name: string;
+        email: string;
+        company_name: string;
+        theme: 'light' | 'dark';
+        is_demo: number;
+      }
+    | undefined;
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.is_demo === 1 ? 'Guest' : row.name,
+    email: row.is_demo === 1 ? '' : row.email,
+    companyName: row.is_demo === 1 ? 'Demo Workspace' : row.company_name,
+    theme: row.theme,
+    isDemo: row.is_demo === 1,
+  };
+}
+
+export function deleteDemoUser(id: string): void {
+  db.prepare(`DELETE FROM users WHERE id = ? AND is_demo = 1`).run(id);
+}
+
+export function deleteExpiredDemoUsers(olderThan: string): void {
+  const expiredUsers = db
+    .prepare(`SELECT id FROM users WHERE is_demo = 1 AND created_at <= ?`)
+    .all(olderThan) as Array<{ id: string }>;
+  const removeUser = db.prepare(`DELETE FROM users WHERE id = ? AND is_demo = 1`);
+  const cleanup = db.transaction((userIds: string[]) => {
+    for (const id of userIds) removeUser.run(id);
   });
+  cleanup(expiredUsers.map((user) => user.id));
+}
+
+export function disableLegacyPassword(userId: string): void {
+  db.prepare(`UPDATE users SET password_hash = ? WHERE id = ? AND is_demo = 0`).run(
+    `firebase-auth-only:${crypto.randomBytes(24).toString('hex')}`,
+    userId
+  );
 }
 
 export function getOrCreateFirebaseUser(params: {
