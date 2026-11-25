@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.companyName is string
+        && request.resource.data.companyName.size() <= 100
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'name', 'companyName', 'createdAt', 'updatedAt'
+        ]);
+      allow update: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.companyName is string
+        && request.resource.data.companyName.size() <= 100
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'name', 'companyName', 'createdAt', 'updatedAt'
+        ]);
+      allow delete: if false;
+
+      match /settings/{settingId} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow create, update: if request.auth != null
+          && request.auth.uid == uid
+          && settingId == 'preferences'
+          && request.resource.data.keys().hasOnly(['theme', 'updatedAt'])
+          && request.resource.data.theme in ['light', 'dark'];
+        allow delete: if false;
+      }
+
+      match /chats/{chatId} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow create, update: if request.auth != null
+          && request.auth.uid == uid
+          && request.resource.data.channel == chatId
+          && chatId in ['command', 'alex', 'emma', 'max', 'sophie', 'charlie']
+          && request.resource.data.keys().hasOnly(['channel', 'updatedAt']);
+        allow delete: if false;
+
+        match /messages/{messageId} {
+          allow read: if request.auth != null && request.auth.uid == uid;
+          allow create, update: if request.auth != null
+            && request.auth.uid == uid
+            && request.resource.data.id == messageId
+            && request.resource.data.channel == chatId
+            && request.resource.data.sender in [
+              'ceo', 'alex', 'emma', 'max', 'sophie', 'charlie', 'system'
+            ]
+            && request.resource.data.text is string
+            && request.resource.data.text.size() > 0
+            && request.resource.data.text.size() <= 30000
+            && (request.resource.data.metadata == null
+              || request.resource.data.metadata is map)
+            && request.resource.data.createdAt is string
+            && request.resource.data.keys().hasOnly([
+              'id', 'channel', 'sender', 'text', 'metadata', 'createdAt'
+            ]);
+          allow delete: if false;
+        }
+      }
+    }
+
+    match /apiRateLimits/{rateLimitId} {
+      allow read, write: if false;
+    }
+  }
+}

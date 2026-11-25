@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -9,18 +10,17 @@ import {
   addEmailItem,
   addNotification,
   createApproval,
-  createSession,
+  createDemoUser,
   createTask,
-  createUser,
   decideApproval,
-  deleteSession,
+  disableLegacyPassword,
+  deleteExpiredDemoUsers,
+  deleteDemoUser,
   findUserByEmail,
   getEmployeesForUser,
   getIntegrationsForUser,
   getIntegrationSecret,
-  getOrCreateDemoUser,
   getOrCreateFirebaseUser,
-  getUserByToken,
   getWorkspacePayload,
   markAllNotificationsRead,
   updateEmailAnalysis,
@@ -30,6 +30,19 @@ import {
   updateUserSettings,
   verifyPassword,
 } from './server/db.ts';
+import {
+  enforceRateLimit,
+  ensureFirestoreUser,
+  getUserChats,
+  saveUserChats,
+  updateFirestoreUser,
+} from './server/firestore.ts';
+import {
+  createDemoSession,
+  deleteDemoSession,
+  getDemoSession,
+} from './server/demoSession.ts';
+import { InvalidChatMessageError } from './server/firestore.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
   FirebaseAccountConflictError,
@@ -71,6 +84,7 @@ import {
 import type {
   ApprovalActionType,
   BotId,
+  ChatMessage,
   CollaborationStep,
   ConnectorPermissionLevel,
   ConnectorServiceKey,
@@ -84,11 +98,161 @@ declare global {
     interface Request {
       user?: UserProfile;
       token?: string;
+      sessionMode?: 'account' | 'demo';
     }
   }
 }
 
 const isProduction = process.env.NODE_ENV === 'production';
+const DEMO_COOKIE = 'robot_ai_demo';
+const DEMO_SESSION_TTL_SECONDS = 30 * 60;
+const DEMO_LOCAL_CLEANUP_INTERVAL_MS = 60 * 1000;
+let lastDemoLocalCleanupAt = 0;
+const demoRateLimits = new Map<string, { count: number; expiresAt: number }>();
+let lastDemoRateLimitCleanupAt = 0;
+
+class InvalidFirebaseTokenError extends Error {}
+
+function getCookieValue(req: express.Request, name: string): string | null {
+  const cookies = req.headers.cookie?.split(';') ?? [];
+  for (const cookie of cookies) {
+    const [key, ...valueParts] = cookie.trim().split('=');
+    if (key === name) {
+      try {
+        return decodeURIComponent(valueParts.join('='));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function clearDemoCookie(res: express.Response): void {
+  res.clearCookie(DEMO_COOKIE, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/api',
+  });
+}
+
+function demoCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax' as const,
+    path: '/api',
+    maxAge: DEMO_SESSION_TTL_SECONDS * 1000,
+  };
+}
+
+function isSameOriginRequest(req: express.Request): boolean {
+  const origin = req.get('origin');
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(`${req.protocol}://${req.get('host')}`).origin;
+  } catch {
+    return false;
+  }
+}
+
+function requireSameOrigin(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  if (!isSameOriginRequest(req)) {
+    res.status(403).json({ error: 'Cross-origin session requests are not allowed.' });
+    return;
+  }
+  next();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+async function getAccountUserFromToken(token: string): Promise<UserProfile> {
+  let decoded: Awaited<ReturnType<typeof adminAuth.verifyIdToken>>;
+  try {
+    decoded = await adminAuth.verifyIdToken(token, true);
+  } catch {
+    throw new InvalidFirebaseTokenError();
+  }
+
+  const email = decoded.email || `${decoded.uid}@google-workspace.local`;
+  const localUser = getOrCreateFirebaseUser({
+    uid: decoded.uid,
+    email,
+    name: decoded.name,
+  });
+  if (localUser.isDemo) {
+    throw new FirebaseAccountConflictError();
+  }
+  const profile = await ensureFirestoreUser({
+    uid: decoded.uid,
+    email,
+    name: decoded.name,
+  });
+  updateUserSettings(decoded.uid, {
+    name: profile.name,
+    companyName: profile.companyName,
+    theme: profile.theme,
+  });
+  return profile;
+}
+
+function rateLimitPublicEndpoint(
+  endpoint: string,
+  limit: number,
+  windowMs: number
+): express.RequestHandler {
+  return async (req, res, next) => {
+    const clientAddress = req.ip || req.socket.remoteAddress || 'unknown';
+    try {
+      const allowed = await enforceRateLimit({
+        key: `${endpoint}:${clientAddress}`,
+        limit,
+        windowMs,
+      });
+      if (!allowed) {
+        res.status(429).json({ error: 'Too many requests. Please try again later.' });
+        return;
+      }
+      next();
+    } catch {
+      res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
+    }
+  };
+}
+
+function rateLimitDemoEndpoint(limit: number, windowMs: number): express.RequestHandler {
+  return (req, res, next) => {
+    const now = Date.now();
+    if (now - lastDemoRateLimitCleanupAt >= 60 * 1000) {
+      for (const [key, state] of demoRateLimits) {
+        if (state.expiresAt <= now) demoRateLimits.delete(key);
+      }
+      lastDemoRateLimitCleanupAt = now;
+    }
+
+    const clientAddress = req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `demo-session:${clientAddress}`;
+    const current = demoRateLimits.get(key);
+    if (!current || current.expiresAt <= now) {
+      demoRateLimits.set(key, { count: 1, expiresAt: now + windowMs });
+      next();
+      return;
+    }
+    if (current.count >= limit) {
+      res.status(429).json({ error: 'Too many requests. Please try again later.' });
+      return;
+    }
+    current.count += 1;
+    next();
+  };
+}
 
 async function dispatchN8nWorkflow(params: {
   userId: string;
@@ -226,36 +390,84 @@ async function requireAuth(
 ) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const demoToken = getCookieValue(req, DEMO_COOKIE);
+  if (token && demoToken) {
+    res.status(409).json({ error: 'End the current demo session before signing in.' });
+    return;
+  }
+
+  if (!token && demoToken) {
+    try {
+      const session = getDemoSession(demoToken);
+      if (!session || session.expired) {
+        if (session?.expired) deleteDemoUser(session.userId);
+        clearDemoCookie(res);
+        res.status(401).json({ error: 'Demo session expired. Start a new demo session.' });
+        return;
+      }
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !isSameOriginRequest(req)) {
+        res.status(403).json({ error: 'Cross-origin demo requests are not allowed.' });
+        return;
+      }
+      req.user = createDemoUser(session.userId);
+      req.sessionMode = 'demo';
+      next();
+      return;
+    } catch {
+      res.status(503).json({ error: 'Demo session service is temporarily unavailable.' });
+      return;
+    }
+  }
+
   if (!token) {
     res.status(401).json({ error: 'Authentication required.' });
     return;
   }
 
-  const sessionUser = getUserByToken(token);
-  if (sessionUser) {
-    req.user = sessionUser;
-    req.token = token;
-    next();
-    return;
-  }
-
   try {
-    const decoded = await adminAuth.verifyIdToken(token);
-    const email = decoded.email || `${decoded.uid}@google-workspace.local`;
-    const user = getOrCreateFirebaseUser({
-      uid: decoded.uid,
-      email,
-      name: decoded.name,
-    });
-    req.user = user;
+    req.user = await getAccountUserFromToken(token);
     req.token = token;
+    req.sessionMode = 'account';
     next();
   } catch (error) {
-    if (error instanceof FirebaseAccountConflictError) {
+    if (error instanceof InvalidFirebaseTokenError) {
+      res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
+    } else if (error instanceof FirebaseAccountConflictError) {
       res.status(409).json({ error: error.message });
-      return;
+    } else {
+      res.status(503).json({ error: 'Account data service is temporarily unavailable.' });
     }
-    res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
+  }
+}
+
+async function requireFirebaseAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  if (getCookieValue(req, DEMO_COOKIE)) {
+    res.status(401).json({ error: 'Demo sessions cannot access account APIs.' });
+    return;
+  }
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  if (!token) {
+    res.status(401).json({ error: 'Firebase authentication is required.' });
+    return;
+  }
+  try {
+    req.user = await getAccountUserFromToken(token);
+    req.token = token;
+    req.sessionMode = 'account';
+    next();
+  } catch (error) {
+    if (error instanceof InvalidFirebaseTokenError) {
+      res.status(401).json({ error: 'Session expired or invalid. Please sign in again.' });
+    } else if (error instanceof FirebaseAccountConflictError) {
+      res.status(409).json({ error: error.message });
+    } else {
+      res.status(503).json({ error: 'Account data service is temporarily unavailable.' });
+    }
   }
 }
 
@@ -273,110 +485,208 @@ function requireNonDemoUser(
 
 export async function createApp(options: { serveFrontend?: boolean } = {}) {
   const app = express();
+  if (process.env.VERCEL) app.set('trust proxy', 1);
   app.use(express.json({ limit: '1mb' }));
+  app.use((_req, _res, next) => {
+    const now = Date.now();
+    if (now - lastDemoLocalCleanupAt >= DEMO_LOCAL_CLEANUP_INTERVAL_MS) {
+      deleteExpiredDemoUsers(new Date(now - 35 * 60 * 1000).toISOString());
+      lastDemoLocalCleanupAt = now;
+    }
+    next();
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'robot-office-ai' });
   });
 
   // --- Auth Routes ---
-  app.post('/api/auth/register', (req, res) => {
-    const { name, email, companyName, password } = req.body as {
-      name?: string;
-      email?: string;
-      companyName?: string;
-      password?: string;
-    };
+  app.post(
+    '/api/auth/register',
+    rateLimitPublicEndpoint('auth-register', 10, 15 * 60 * 1000),
+    requireFirebaseAuth,
+    async (req, res) => {
+      if (!isRecord(req.body)) {
+        res.status(400).json({ error: 'A valid registration profile is required.' });
+        return;
+      }
+      const { name, companyName } = req.body;
+      if (typeof name !== 'string' || !name.trim() || name.trim().length > 100) {
+        res.status(400).json({ error: 'A name of 1-100 characters is required.' });
+        return;
+      }
+      if (
+        companyName !== undefined &&
+        (typeof companyName !== 'string' || companyName.trim().length > 100)
+      ) {
+        res.status(400).json({ error: 'Company name must be 100 characters or fewer.' });
+        return;
+      }
+      try {
+        const user = await updateFirestoreUser(req.user!.id, {
+          name: name.trim(),
+          ...(companyName === undefined ? {} : { companyName: companyName.trim() }),
+        });
+        updateUserSettings(user.id, {
+          name: user.name,
+          companyName: user.companyName,
+          theme: user.theme,
+        });
+        res.status(201).json({ user });
+      } catch {
+        res.status(503).json({ error: 'Unable to save the account profile right now.' });
+      }
+    }
+  );
 
-    if (!name?.trim() || !email?.trim() || !password) {
-      res.status(400).json({ error: 'Name, email, and password are required.' });
-      return;
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      res.status(400).json({ error: 'Please enter a valid email address.' });
-      return;
-    }
-    if (password.length < 6) {
-      res.status(400).json({ error: 'Password must be at least 6 characters.' });
-      return;
-    }
-    if (findUserByEmail(email.trim())) {
-      res.status(409).json({ error: 'An account with that email already exists.' });
-      return;
-    }
+  app.post(
+    '/api/auth/login',
+    rateLimitPublicEndpoint('auth-login', 10, 15 * 60 * 1000),
+    async (req, res) => {
+      const authHeader = req.headers.authorization || '';
+      const idToken = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+      if (idToken) {
+        try {
+          const user = await getAccountUserFromToken(idToken);
+          res.json({ user });
+        } catch (error) {
+          if (error instanceof InvalidFirebaseTokenError) {
+            res.status(401).json({ error: 'Invalid Firebase authentication token.' });
+          } else if (error instanceof FirebaseAccountConflictError) {
+            res.status(409).json({ error: error.message });
+          } else {
+            res.status(503).json({ error: 'Account data service is temporarily unavailable.' });
+          }
+        }
+        return;
+      }
 
-    const user = createUser({
-      name: name.trim(),
-      email: email.trim().toLowerCase(),
-      companyName: companyName?.trim() || 'Autonomous Ventures Inc.',
-      password,
-    });
-    const token = createSession(user.id);
-    res.status(201).json({ token, user });
+      const body = isRecord(req.body) ? req.body : {};
+      const email = body.email;
+      const password = body.password;
+      if (
+        typeof email !== 'string' ||
+        !email.trim() ||
+        typeof password !== 'string' ||
+        !password ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      ) {
+        res.status(400).json({ error: 'A valid email and password are required.' });
+        return;
+      }
+      const found = findUserByEmail(email.trim());
+      if (!found || found.is_demo === 1 || !verifyPassword(password, found.password_hash)) {
+        res.status(401).json({ error: 'Invalid email or password.' });
+        return;
+      }
+
+      try {
+        let firebaseUser;
+        try {
+          firebaseUser = await adminAuth.getUserByEmail(found.email);
+        } catch (error) {
+          const code =
+            error && typeof error === 'object' && 'code' in error
+              ? error.code
+              : undefined;
+          if (code !== 'auth/user-not-found') throw error;
+          try {
+            firebaseUser = await adminAuth.createUser({
+              uid: found.id,
+              email: found.email,
+              password,
+              displayName: found.name,
+            });
+          } catch (createError) {
+            const createCode =
+              createError && typeof createError === 'object' && 'code' in createError
+                ? createError.code
+                : undefined;
+            if (createCode !== 'auth/email-already-exists') throw createError;
+            firebaseUser = await adminAuth.getUserByEmail(found.email);
+          }
+        }
+        if (firebaseUser.uid !== found.id) {
+          res.status(409).json({
+            error: 'This email is already linked to a different Firebase account.',
+          });
+          return;
+        }
+        await adminAuth.updateUser(firebaseUser.uid, { password });
+        const customToken = await adminAuth.createCustomToken(firebaseUser.uid);
+        disableLegacyPassword(found.id);
+        res.json({ customToken });
+      } catch {
+        res.status(503).json({ error: 'Unable to securely migrate this account right now.' });
+      }
+    }
+  );
+
+  app.post('/api/auth/firebase', requireFirebaseAuth, (req, res) => {
+    res.json({ user: req.user });
   });
 
-  app.post('/api/auth/login', (req, res) => {
-    const { email, password } = req.body as { email?: string; password?: string };
-    if (!email?.trim() || !password) {
-      res.status(400).json({ error: 'Email and password are required.' });
-      return;
-    }
-    const found = findUserByEmail(email.trim());
-    if (!found || found.is_demo === 1 || !verifyPassword(password, found.password_hash)) {
-      res.status(401).json({ error: 'Invalid email or password.' });
-      return;
-    }
-
-    const user: UserProfile = {
-      id: found.id,
-      name: found.name,
-      email: found.email,
-      companyName: found.company_name,
-      theme: found.theme,
-      isDemo: false,
-    };
-    const token = createSession(user.id);
-    res.json({ token, user });
-  });
-
-  app.post('/api/auth/demo', (_req, res) => {
-    const user = getOrCreateDemoUser();
-    const token = createSession(user.id);
-    res.json({ token, user });
-  });
-
-  app.post('/api/auth/firebase', async (req, res) => {
-    const authHeader = req.headers.authorization || '';
-    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (!idToken) {
-      res.status(401).json({ error: 'Missing Firebase ID token.' });
+  app.post('/api/demo/session', rateLimitDemoEndpoint(10, 15 * 60 * 1000), requireSameOrigin, async (req, res) => {
+    if (req.headers.authorization) {
+      res.status(409).json({ error: 'Sign out of the account before entering Demo Mode.' });
       return;
     }
     try {
-      const decoded = await adminAuth.verifyIdToken(idToken);
-      const email = decoded.email || `${decoded.uid}@google-workspace.local`;
-      const user = getOrCreateFirebaseUser({
-        uid: decoded.uid,
-        email,
-        name: decoded.name,
-      });
-      res.json({ token: idToken, user });
-    } catch (error) {
-      if (error instanceof FirebaseAccountConflictError) {
-        res.status(409).json({ error: error.message });
-        return;
+      deleteExpiredDemoUsers(
+        new Date(Date.now() - 35 * 60 * 1000).toISOString()
+      );
+
+      const previousToken = getCookieValue(req, DEMO_COOKIE);
+      if (previousToken) {
+        const previousUserId = await deleteDemoSession(previousToken);
+        if (previousUserId) deleteDemoUser(previousUserId);
       }
-      res.status(401).json({ error: 'Invalid Firebase authentication token.' });
+
+      const userId = `demo_${randomUUID().replaceAll('-', '')}`;
+      const user = createDemoUser(userId);
+      let session: Awaited<ReturnType<typeof createDemoSession>>;
+      try {
+        session = createDemoSession(userId);
+      } catch (error) {
+        deleteDemoUser(userId);
+        throw error;
+      }
+      res.cookie(DEMO_COOKIE, session.token, demoCookieOptions());
+      res.status(201).json({ user });
+    } catch (error) {
+      res.status(503).json({
+        error:
+          error instanceof Error && error.message.includes('DEMO_SESSION_SECRET')
+            ? error.message
+            : 'Unable to start a demo session right now.',
+      });
     }
   });
 
-  app.post('/api/auth/logout', requireAuth, (req, res) => {
-    if (req.token) deleteSession(req.token);
+  app.delete('/api/demo/session', requireSameOrigin, async (req, res) => {
+    clearDemoCookie(res);
+    const token = getCookieValue(req, DEMO_COOKIE);
+    if (!token) {
+      res.status(204).end();
+      return;
+    }
+    try {
+      const userId = deleteDemoSession(token);
+      if (userId) deleteDemoUser(userId);
+      res.status(204).end();
+    } catch {
+      res.status(503).json({ error: 'Unable to end the demo session right now.' });
+    }
+  });
+
+  app.post('/api/auth/logout', requireFirebaseAuth, (_req, res) => {
     res.json({ ok: true });
   });
 
   app.get('/api/auth/me', requireAuth, (req, res) => {
-    res.json({ user: req.user });
+    res.json({ user: req.user, mode: req.sessionMode });
   });
 
   // --- Workspace Hydration ---
@@ -385,12 +695,75 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
     res.json(payload);
   });
 
-  app.patch('/api/settings/profile', requireAuth, (req, res) => {
-    const { theme, name, companyName } = req.body as {
-      theme?: 'light' | 'dark';
-      name?: string;
-      companyName?: string;
-    };
+  app.get('/api/users/me', requireFirebaseAuth, (req, res) => {
+    res.json({ user: req.user });
+  });
+
+  app.get('/api/users/me/chats', requireFirebaseAuth, async (req, res) => {
+    try {
+      res.json({ messages: await getUserChats(req.user!.id) });
+    } catch {
+      res.status(503).json({ error: 'Unable to load saved conversations right now.' });
+    }
+  });
+
+  app.post(
+    '/api/users/me/chats',
+    rateLimitPublicEndpoint('user-chat-write', 60, 15 * 60 * 1000),
+    requireFirebaseAuth,
+    async (req, res) => {
+    const body = isRecord(req.body) ? req.body : {};
+    if (!Array.isArray(body.messages) || body.messages.length > 200) {
+      res.status(400).json({ error: 'Provide up to 200 valid chat messages.' });
+      return;
+    }
+    try {
+      await saveUserChats(req.user!.id, body.messages);
+      res.json({ ok: true, saved: body.messages.length });
+    } catch (error) {
+      if (error instanceof InvalidChatMessageError) {
+        res.status(400).json({ error: error.message });
+      } else {
+        res.status(503).json({ error: 'Unable to save conversations right now.' });
+      }
+    }
+    }
+  );
+
+  app.patch('/api/settings/profile', requireAuth, async (req, res) => {
+    if (!isRecord(req.body)) {
+      res.status(400).json({ error: 'Invalid profile settings.' });
+      return;
+    }
+    const { theme, name, companyName } = req.body;
+    if (
+      (theme !== undefined && theme !== 'light' && theme !== 'dark') ||
+      (name !== undefined &&
+        (typeof name !== 'string' || !name.trim() || name.trim().length > 100)) ||
+      (companyName !== undefined &&
+        (typeof companyName !== 'string' || companyName.trim().length > 100))
+    ) {
+      res.status(400).json({ error: 'Invalid profile settings.' });
+      return;
+    }
+    if (!req.user!.isDemo) {
+      try {
+        const updated = await updateFirestoreUser(req.user!.id, {
+          theme,
+          name: name?.trim(),
+          companyName: companyName?.trim(),
+        });
+        updateUserSettings(req.user!.id, {
+          theme: updated.theme,
+          name: updated.name,
+          companyName: updated.companyName,
+        });
+        res.json({ user: updated });
+      } catch {
+        res.status(503).json({ error: 'Unable to save profile settings right now.' });
+      }
+      return;
+    }
     const updated = updateUserSettings(req.user!.id, { theme, name, companyName });
     if (!updated) {
       res.status(404).json({ error: 'User not found.' });

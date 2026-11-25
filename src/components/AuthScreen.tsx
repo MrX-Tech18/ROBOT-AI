@@ -1,6 +1,15 @@
 import { useState, type FormEvent } from 'react';
 import { ArrowRight, Building2, Lock, Mail, Moon, Sun, User } from 'lucide-react';
+import {
+  createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
+  signInWithCustomToken,
+  signInWithEmailAndPassword,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
 import { api } from '../lib/api';
+import { auth, authPersistenceReady } from '../lib/firebase';
 import { signInWithGoogle } from '../lib/googleWorkspace';
 import type { BotId, UserProfile } from '../shared/types';
 import CuteRobotAvatar from './CuteRobotAvatar';
@@ -9,33 +18,69 @@ import GoogleSignInButton from './GoogleSignInButton';
 interface AuthScreenProps {
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
-  onAuthenticated: (user: UserProfile) => void;
+  onAuthenticated: (user: UserProfile) => Promise<void>;
+  authError?: string | null;
 }
 
 export default function AuthScreen({
   theme,
   onToggleTheme,
   onAuthenticated,
+  authError,
 }: AuthScreenProps) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [name, setName] = useState('');
   const [companyName, setCompanyName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(authError ?? null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     setSubmitting(true);
     try {
+      await authPersistenceReady;
+      await api.exitDemo();
       if (mode === 'login') {
-        const res = await api.login(email, password);
-        onAuthenticated(res.user);
+        let res: { user: UserProfile };
+        try {
+          const credential = await signInWithEmailAndPassword(auth, email.trim(), password);
+          res = await api.loginWithFirebase(await credential.user.getIdToken());
+        } catch (firebaseError) {
+          const code =
+            firebaseError &&
+            typeof firebaseError === 'object' &&
+            'code' in firebaseError &&
+            typeof firebaseError.code === 'string'
+              ? firebaseError.code
+              : '';
+          if (
+            ![
+              'auth/user-not-found',
+              'auth/invalid-credential',
+              'auth/wrong-password',
+            ].includes(code)
+          ) {
+            throw firebaseError;
+          }
+          const legacy = await api.loginLegacy(email.trim(), password);
+          const credential = await signInWithCustomToken(auth, legacy.customToken);
+          res = await api.loginWithFirebase(await credential.user.getIdToken());
+        }
+        await onAuthenticated(res.user);
       } else {
-        const res = await api.register({ name, companyName, email, password });
-        onAuthenticated(res.user);
+        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        await updateProfile(credential.user, { displayName: name.trim() });
+        const res = await api.register({
+          name: name.trim(),
+          companyName: companyName.trim(),
+          email: credential.user.email || email.trim(),
+        });
+        await onAuthenticated(res.user);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');
@@ -46,10 +91,14 @@ export default function AuthScreen({
 
   const handleDemo = async () => {
     setError(null);
+    setNotice(null);
     setSubmitting(true);
     try {
+      await authPersistenceReady;
+      if (auth.currentUser) await signOut(auth);
+      await api.exitDemo();
       const res = await api.enterDemo();
-      onAuthenticated(res.user);
+      await onAuthenticated(res.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to start demo workspace.');
     } finally {
@@ -59,13 +108,35 @@ export default function AuthScreen({
 
   const handleGoogleSignIn = async () => {
     setError(null);
+    setNotice(null);
     setSubmitting(true);
     try {
+      await authPersistenceReady;
+      await api.exitDemo();
       const googleAuth = await signInWithGoogle();
       const res = await api.loginWithFirebase(googleAuth.idToken);
-      onAuthenticated(res.user);
+      await onAuthenticated(res.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Google Sign-In did not complete.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handlePasswordReset = async () => {
+    setError(null);
+    setNotice(null);
+    if (!email.trim()) {
+      setError('Enter your email address first.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await authPersistenceReady;
+      await sendPasswordResetEmail(auth, email.trim());
+      setNotice('Password reset email sent. Check your inbox.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to send password reset email.');
     } finally {
       setSubmitting(false);
     }
@@ -170,7 +241,7 @@ export default function AuthScreen({
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
-                CEO Sign In
+                LOGIN
               </button>
               <button
                 type="button"
@@ -184,7 +255,7 @@ export default function AuthScreen({
                     : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                 }`}
               >
-                Register Company
+                CREATE ACCOUNT
               </button>
             </div>
 
@@ -194,6 +265,14 @@ export default function AuthScreen({
                 className="mb-4 p-3 rounded-lg border border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 text-sm text-red-700 dark:text-red-300"
               >
                 {error}
+              </div>
+            )}
+            {notice && (
+              <div
+                role="status"
+                className="mb-4 p-3 rounded-lg border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50 dark:bg-emerald-950/40 text-sm text-emerald-700 dark:text-emerald-300"
+              >
+                {notice}
               </div>
             )}
 
@@ -266,9 +345,19 @@ export default function AuthScreen({
               <div>
                 <label
                   htmlFor="ceo-password"
-                  className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
+                  className="flex items-center justify-between text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
                 >
                   Password
+                  {mode === 'login' && (
+                    <button
+                      type="button"
+                      onClick={handlePasswordReset}
+                      disabled={submitting}
+                      className="text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50"
+                    >
+                      Forgot password?
+                    </button>
+                  )}
                 </label>
                 <div className="relative">
                   <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -319,7 +408,7 @@ export default function AuthScreen({
                 disabled={submitting}
                 className="w-full py-2.5 px-4 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 hover:bg-slate-100 dark:hover:bg-slate-800 text-sm font-medium text-slate-900 dark:text-slate-100 transition-colors"
               >
-                Enter Demo CEO Workspace
+                CONTINUE AS GUEST (DEMO MODE)
               </button>
             </div>
           </div>
