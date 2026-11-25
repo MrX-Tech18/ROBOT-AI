@@ -43,6 +43,10 @@ import {
   getDemoSession,
 } from './server/demoSession.ts';
 import { InvalidChatMessageError } from './server/firestore.ts';
+import {
+  isInvalidFirebaseTokenError,
+  logAuthBackendFailure,
+} from './server/authErrors.ts';
 import { postWebhookJson } from './server/webhookRequest.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
@@ -178,8 +182,12 @@ async function getAccountUserFromToken(token: string): Promise<UserProfile> {
   let decoded: Awaited<ReturnType<typeof adminAuth.verifyIdToken>>;
   try {
     decoded = await adminAuth.verifyIdToken(token, true);
-  } catch {
-    throw new InvalidFirebaseTokenError();
+  } catch (error) {
+    if (isInvalidFirebaseTokenError(error)) {
+      throw new InvalidFirebaseTokenError();
+    }
+    logAuthBackendFailure('verify-firebase-token', error);
+    throw error;
   }
 
   const email = decoded.email || `${decoded.uid}@google-workspace.local`;
@@ -222,7 +230,8 @@ function rateLimitPublicEndpoint(
         return;
       }
       next();
-    } catch {
+    } catch (error) {
+      logAuthBackendFailure(`rate-limit:${endpoint}`, error);
       res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
     }
   };
@@ -435,6 +444,7 @@ async function requireAuth(
     } else if (error instanceof FirebaseAccountConflictError) {
       res.status(409).json({ error: error.message });
     } else {
+      logAuthBackendFailure('account-session', error);
       res.status(503).json({ error: 'Account data service is temporarily unavailable.' });
     }
   }
@@ -533,7 +543,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
           theme: user.theme,
         });
         res.status(201).json({ user });
-      } catch {
+      } catch (error) {
+        logAuthBackendFailure('save-account-profile', error);
         res.status(503).json({ error: 'Unable to save the account profile right now.' });
       }
     }
@@ -557,6 +568,7 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
           } else if (error instanceof FirebaseAccountConflictError) {
             res.status(409).json({ error: error.message });
           } else {
+            logAuthBackendFailure('firebase-login', error);
             res.status(503).json({ error: 'Account data service is temporarily unavailable.' });
           }
         }
@@ -576,8 +588,19 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         res.status(400).json({ error: 'A valid email and password are required.' });
         return;
       }
-      const found = findUserByEmail(email.trim());
-      if (!found || found.is_demo === 1 || !verifyPassword(password, found.password_hash)) {
+      let found: ReturnType<typeof findUserByEmail>;
+      let credentialsMatch = false;
+      try {
+        found = findUserByEmail(email.trim());
+        credentialsMatch = Boolean(
+          found && found.is_demo !== 1 && verifyPassword(password, found.password_hash)
+        );
+      } catch (error) {
+        logAuthBackendFailure('legacy-login-database', error);
+        res.status(503).json({ error: 'Authentication service is temporarily unavailable.' });
+        return;
+      }
+      if (!found || !credentialsMatch) {
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
       }
@@ -618,7 +641,8 @@ export async function createApp(options: { serveFrontend?: boolean } = {}) {
         const customToken = await adminAuth.createCustomToken(firebaseUser.uid);
         disableLegacyPassword(found.id);
         res.json({ customToken });
-      } catch {
+      } catch (error) {
+        logAuthBackendFailure('legacy-login-migration', error);
         res.status(503).json({ error: 'Unable to securely migrate this account right now.' });
       }
     }
